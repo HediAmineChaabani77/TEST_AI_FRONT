@@ -11,8 +11,11 @@ Upload any image with text (like a WhatsApp chat about an iPhone order, a handwr
 3. Generate a clean PDF invoice ready to download
 
 Perfect for small businesses, freelancers, or anyone who needs quick invoices from casual orders.
+
 Working locally with using both methods regex and ollama slm model 
+
 Regex works fine for quik simple examples 
+
 Using SLM Moddel for complex extraction tasks 
 
 
@@ -65,7 +68,9 @@ I have choose Render. You will find a quick demo here :
 https://test-ai-front.onrender.com/
 
 On the Render server : 
+
 Only Regex works, the ressources are not capable of using ollama. Code in main is adjusted for that 
+
 you will find the code using ollama on the develop branch 
 
 ## Made for
@@ -82,5 +87,7 @@ That's it! Simple tool, clean code, gets the job done
 
 
 Editor: Hedi Amine Chaabani 
+
+
 Date: 04/11/2025
 
