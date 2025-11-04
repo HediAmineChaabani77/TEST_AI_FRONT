@@ -1,0 +1,21 @@
+# OCR Invoice Generator - Python Dependencies
+
+# Web Framework
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# Image Processing
+Pillow==10.1.0
+
+# OCR Engine
+pytesseract==0.3.10
+
+# AI/LLM for Smart Extraction
+ollama==0.3.3
+
+# PDF Generation
+reportlab==4.0.7
+
+# Utilities
+python-dateutil==2.8.2
+
