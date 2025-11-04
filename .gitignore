@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+uploads/
+invoices/
+*.pdf
+*.jpg
+*.jpeg
+*.png
+.env
+.vscode/
+.idea/
+*.log
+
