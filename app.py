@@ -51,9 +51,14 @@ from reportlab.platypus.doctemplate import PageTemplate, BaseDocTemplate
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['INVOICE_FOLDER'] = 'invoices'
 
+# Use absolute paths to ensure directories are created in the correct location
+# This is important for Fly.io and other cloud platforms with ephemeral filesystems
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'uploads')
+app.config['INVOICE_FOLDER'] = os.path.join(BASE_DIR, 'invoices')
+
+# Ensure directories exist at runtime (important for Fly.io)
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['INVOICE_FOLDER'], exist_ok=True)
 
@@ -686,9 +691,16 @@ def process_image():
         
         method_used = 'gemini'
         
+        # Ensure invoice folder exists before saving (important for Fly.io)
+        os.makedirs(app.config['INVOICE_FOLDER'], exist_ok=True)
+        
         pdf_filename = f"invoice_{timestamp}.pdf"
         pdf_path = os.path.join(app.config['INVOICE_FOLDER'], pdf_filename)
         generate_pdf_invoice(invoice_data, pdf_path)
+        
+        # Verify PDF was created
+        if not os.path.exists(pdf_path):
+            return jsonify({'error': f'Failed to create PDF at {pdf_path}'}), 500
         
         with open(pdf_path, 'rb') as pdf_file:
             pdf_base64 = base64.b64encode(pdf_file.read()).decode('utf-8')
@@ -709,10 +721,26 @@ def process_image():
 @app.route('/api/download/<filename>')
 def download_invoice(filename):
     try:
+        # Ensure invoice folder exists
+        os.makedirs(app.config['INVOICE_FOLDER'], exist_ok=True)
+        
         filepath = os.path.join(app.config['INVOICE_FOLDER'], secure_filename(filename))
+        
+        # Check if file exists
+        if not os.path.exists(filepath):
+            return jsonify({
+                'error': f'File not found: {filepath}',
+                'invoice_folder': app.config['INVOICE_FOLDER'],
+                'filename': filename
+            }), 404
+        
         return send_file(filepath, as_attachment=True, download_name=filename)
     except Exception as e:
-        return jsonify({'error': str(e)}), 404
+        return jsonify({
+            'error': str(e),
+            'invoice_folder': app.config.get('INVOICE_FOLDER', 'not set'),
+            'filename': filename
+        }), 404
 
 
 if __name__ == '__main__':
@@ -726,6 +754,11 @@ if __name__ == '__main__':
         print("✗ ERROR: Google Gemini not available!")
         print("  This version REQUIRES Gemini to function.")
         print("  Install: pip install google-genai")
+    print("=" * 60)
+    print(f"📁 Base Directory: {BASE_DIR}")
+    print(f"📁 Upload Folder: {app.config['UPLOAD_FOLDER']}")
+    print(f"📁 Invoice Folder: {app.config['INVOICE_FOLDER']}")
+    print(f"✓ Directories created: {os.path.exists(app.config['UPLOAD_FOLDER'])} (uploads), {os.path.exists(app.config['INVOICE_FOLDER'])} (invoices)")
     print("=" * 60)
     print("🌐 Server running at: http://localhost:5000")
     print("=" * 60)
