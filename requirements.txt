@@ -1,10 +1,9 @@
 Flask==3.0.0
 Werkzeug==3.0.1
-Pillow==10.1.0
+Pillow==10.1.0 ; python_version == "3.11"
 pytesseract==0.3.10
 reportlab==4.0.7
 python-dateutil==2.8.2
 google-genai>=0.2.0
-python_version == "3.12"
 
 
