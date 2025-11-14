@@ -1,6 +1,8 @@
 """
+Test AI Frontend for OCR Invoice Generator - Gemini Only Version
 Flask Backend for OCR Invoice Generator
-Production version - Regex only (Ollama as optional fallback)
+HTML/CSS frontend with a simple interface to upload an image and get the invoice data
+Gemini ONLY version - uses Google Gemini 2.5 Flash for invoice data extraction (no regex, no ollama)
 """
 import os
 import json
@@ -9,7 +11,6 @@ from werkzeug.utils import secure_filename
 from datetime import datetime
 import base64
 from io import BytesIO
-import re
 
 # OCR and Image Processing
 try:
@@ -17,22 +18,36 @@ try:
     import pytesseract
     OCR_ENGINE = 'tesseract'
 except ImportError:
-    OCR_ENGINE = None
+    try:
+        import easyocr
+        OCR_ENGINE = 'easyocr'
+        reader = easyocr.Reader(['fr', 'en'])
+    except ImportError:
+        OCR_ENGINE = None
 
-# LLM optional
+# LLM for intelligent interpretation - Google Gemini ONLY
 try:
-    import ollama
+    from google import genai
     LLM_AVAILABLE = True
+    GEMINI_API_KEY = "AIzaSyCkpUCP0G_3XGHmAn_l7005GdaTpzadDVY"
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    print("✓ Google Gemini available")
 except ImportError:
     LLM_AVAILABLE = False
+    gemini_client = None
+    print("✗ ERROR: Google Gemini not available! This version REQUIRES Gemini.")
+    print("  Install: pip install google-genai")
 
 # PDF Generation
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.units import cm, mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+from reportlab.pdfgen import canvas
+from reportlab.platypus.frames import Frame
+from reportlab.platypus.doctemplate import PageTemplate, BaseDocTemplate
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
@@ -54,6 +69,9 @@ def extract_text_from_image(image_path):
         img = Image.open(image_path)
         if OCR_ENGINE == 'tesseract':
             text = pytesseract.image_to_string(img, lang='fra+eng')
+        elif OCR_ENGINE == 'easyocr':
+            results = reader.readtext(image_path)
+            text = '\n'.join([result[1] for result in results])
         else:
             return None, "OCR engine not available"
         return text.strip(), None
@@ -61,14 +79,63 @@ def extract_text_from_image(image_path):
         return None, f"Error during OCR: {str(e)}"
 
 
-def interpret_with_ollama(extracted_text):
-    if not LLM_AVAILABLE:
-        return None, "Ollama not available"
+def interpret_with_gemini(extracted_text):
+    """
+    Use Google Gemini 2.5 Flash to intelligently extract invoice data with structured output
+    This is the ONLY method used in this version - no regex, no ollama fallback
+    """
+    if not LLM_AVAILABLE or gemini_client is None:
+        return None, "Gemini not available - this version requires Gemini to function"
     
     try:
+        # Define JSON schema for structured output
+        invoice_schema = {
+            "type": "object",
+            "properties": {
+                "client_name": {
+                    "type": "string",
+                    "description": "Client's full name (first name + last name) found in the text"
+                },
+                "client_address": {
+                    "type": "string",
+                    "description": "Client's address (street + postal code + city) if found in the text"
+                },
+                "items": {
+                    "type": "array",
+                    "description": "List of products/items found in the invoice",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {
+                                "type": "string",
+                                "description": "Product name with color information if applicable (e.g., 'iPhone 14 (noir x1, blanc x1)')"
+                            },
+                            "quantity": {
+                                "type": "integer",
+                                "description": "Total quantity of the product"
+                            },
+                            "unit_price": {
+                                "type": "number",
+                                "description": "Unit price if found in text, otherwise null"
+                            },
+                            "total_price": {
+                                "type": "number",
+                                "description": "Total price for this item if found in text, otherwise null"
+                            }
+                        },
+                        "required": ["description", "quantity"]
+                    }
+                },
+                "invoice_total": {
+                    "type": "number",
+                    "description": "Total invoice amount if found in text, otherwise null"
+                }
+            },
+            "required": ["client_name", "client_address", "items"]
+        }
+        
         prompt = f"""
-Analysez le texte ci-dessous et créez une facture AU FORMAT JSON UNIQUEMENT.
-Ne pas écrire de texte en dehors du JSON. Ne rien inventer. N'utiliser que les informations présentes explicitement dans le texte.
+Analysez le texte ci-dessous et extrayez les informations de facture en suivant strictement les règles.
 
 TEXTE :
 {extracted_text}
@@ -104,315 +171,463 @@ RÈGLES GÉNÉRALES :
       - Si Q n'est PAS indiqué :
         - S'il y a des quantités dans les couleurs → total = somme.
         - S'il n'y a pas de quantités dans les couleurs → total = nombre de couleurs.
-   
+
    C. Cas à traiter correctement :
-      - "2 iPhone 14, couleurs:  (noir, 1 blanc" → total = 2 → noir x1, blanc x1.
+      - "2 iPhone 14, couleurs: (noir, 1 blanc" → total = 2 → noir x1, blanc x1.
       - "3 iPhone 14 (noir, rouge, bleu)" → total = 3.
       - "iPhone 14 (noir x2, blanc x1)" → total = 3.
       - "5 iPhone 14 (noir x2, blanc x4)" → total = 5 (tronquer à 5).
-   
+
    D. Dans le JSON, pour la clarté :
       - Utiliser une seule ligne par produit.
       - Ajouter la répartition couleur dans "description", ex:
         "description": "iPhone 14 (noir x1, blanc x1)"
 
-5. FORMAT JSON EXACT :
-{{
-    "client_name": "",
-    "client_address": "",
-    "items": [
-        {{
-            "description": "nom du produit (couleur)",
-            "quantity": nombre_total,
-            "unit_price": prix_unitaire_ou_null,
-            "total_price": prix_total_ou_null
-        }}
-    ],
-    "invoice_total": prix_total_facture_ou_null
-}}
-
-JSON uniquement.
+Retournez UNIQUEMENT les données extraites au format JSON structuré selon le schéma fourni.
+Ne rien inventer. Utilisez uniquement les informations présentes explicitement dans le texte.
 """
-
-        response = ollama.generate(
-            model='llama3.2:1b',
-            prompt=prompt,
-            stream=False,
-            options={'temperature': 0.1, 'num_predict': 400}
-        )
         
-        response_text = response['response'].strip()
+        # Call Gemini with structured output
+        # Try different API formats based on what works
+        response = None
+        last_error = None
+        
+        # Method 1: Try with config parameter (structured output)
+        try:
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-flash-preview-09-2025",
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": invoice_schema,
+                    "temperature": 0.1,
+                }
+            )
+        except Exception as e1:
+            last_error = str(e1)
+            print(f"Method 1 (config) failed: {e1}")
+            
+            # Method 2: Try with parameters dict
+            try:
+                response = gemini_client.models.generate_content(
+                    model="gemini-2.5-flash-preview-09-2025",
+                    contents=prompt,
+                    parameters={
+                        "temperature": 0.1,
+                        "response_mime_type": "application/json",
+                    }
+                )
+            except Exception as e2:
+                last_error = str(e2)
+                print(f"Method 2 (parameters) failed: {e2}")
+                
+                # Method 3: Try simple call (like user's example)
+                try:
+                    response = gemini_client.models.generate_content(
+                        model="gemini-2.5-flash-preview-09-2025",
+                        contents=prompt + "\n\nIMPORTANT: Return ONLY valid JSON matching this schema: " + json.dumps(invoice_schema) + "\nNo additional text, just JSON.",
+                    )
+                except Exception as e3:
+                    last_error = str(e3)
+                    print(f"Method 3 (simple) failed: {e3}")
+                    
+                    # Method 4: Try with shorter model name
+                    try:
+                        response = gemini_client.models.generate_content(
+                            model="gemini-2.5-flash-preview",
+                            contents=prompt + "\n\nIMPORTANT: Return ONLY valid JSON matching this schema: " + json.dumps(invoice_schema) + "\nNo additional text, just JSON.",
+                        )
+                    except Exception as e4:
+                        last_error = str(e4)
+                        print(f"Method 4 (short model name) failed: {e4}")
+                        return None, f"All Gemini API call methods failed. Last error: {last_error}"
+        
+        if response is None:
+            return None, f"Failed to get response from Gemini. Last error: {last_error}"
+        
+        # Parse the structured JSON response
+        response_text = None
+        
+        # Debug: print response type and attributes
+        print(f"Response type: {type(response)}")
+        print(f"Response attributes: {dir(response)}")
+        
+        # Try different ways to extract text from response
+        if hasattr(response, 'text'):
+            response_text = response.text
+            print(f"Got text from response.text: {response_text[:200] if response_text else 'None'}...")
+        elif hasattr(response, 'candidates') and len(response.candidates) > 0:
+            # Alternative response format
+            content = response.candidates[0].content
+            if hasattr(content, 'parts') and len(content.parts) > 0:
+                response_text = content.parts[0].text
+                print(f"Got text from candidates[0].content.parts[0].text: {response_text[:200] if response_text else 'None'}...")
+            elif hasattr(content, 'text'):
+                response_text = content.text
+                print(f"Got text from candidates[0].content.text: {response_text[:200] if response_text else 'None'}...")
+        elif hasattr(response, '__str__'):
+            # Last resort: try to convert to string
+            response_text = str(response)
+            print(f"Got text from str(response): {response_text[:200] if response_text else 'None'}...")
+        
+        if not response_text:
+            return None, f"No response text from Gemini. Response object: {type(response)}, attributes: {[attr for attr in dir(response) if not attr.startswith('_')]}"
+        
+        # Extract JSON from response (handle cases where there might be extra text)
+        response_text = response_text.strip()
+        print(f"Full response text length: {len(response_text)}")
+        
+        # Try to find JSON in the response
         start_idx = response_text.find('{')
         end_idx = response_text.rfind('}') + 1
         
         if start_idx != -1 and end_idx > start_idx:
             json_str = response_text[start_idx:end_idx]
-            llm_data = json.loads(json_str)
-            
-            items = llm_data.get('items', [])
-            if not items:
-                return None, "No items found"
-            
-            total = 0.0
-            for item in items:
-                item['quantity'] = int(item.get('quantity', 1))
-                if 'iphone' in item.get('description', '').lower():
-                    item['unit_price'] = 250.0
-                elif 'unit_price' not in item:
-                    item['unit_price'] = 250.0
-                item['total'] = item['quantity'] * item['unit_price']
-                total += item['total']
-            
-            invoice_data = {
-                'client_name': llm_data.get('client_name', 'Client'),
-                'client_address': llm_data.get('client_address', ''),
-                'date': datetime.now().strftime('%d/%m/%Y'),
-                'invoice_number': f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                'items': items,
-                'total': total,
-                'description': ''
-            }
-            return invoice_data, None
+            try:
+                llm_data = json.loads(json_str)
+                print("Successfully parsed JSON from response")
+            except json.JSONDecodeError as je:
+                return None, f"Failed to parse JSON from response: {str(je)}\nJSON string: {json_str[:500]}"
         else:
-            return None, "Invalid JSON"
-    except Exception as e:
-        return None, f"LLM error: {str(e)}"
-
-
-def interpret_invoice_data(extracted_text):
-    """Regex extraction - primary method"""
-    lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
-    full_text = ' '.join(lines)
-    
-    invoice_data = {
-        'client_name': '',
-        'client_address': '',
-        'date': datetime.now().strftime('%d/%m/%Y'),
-        'invoice_number': f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}",
-        'items': [],
-        'total': 0.0,
-        'description': ''
-    }
-    
-    # Extract address
-    address_pattern = r'(\d+\s+(?:rue|avenue|boulevard|place|chemin|allée|impasse)[^,\n]+,\s*\d{5}\s+[A-Za-zéèêàâôùûîïç]+)'
-    address_match = re.search(address_pattern, full_text, re.IGNORECASE)
-    if address_match:
-        invoice_data['client_address'] = address_match.group(1).strip()
-    
-    # Extract client name
-    name_with_label_pattern = r'(?:^|[.!?]\s+)(?:Nom|Pour|Client)\s*:\s*([A-Z][a-zéèêàâôùûîïç]+\s+[A-Z][a-zéèêàâôùûîïç]+)'
-    name_match = re.search(name_with_label_pattern, full_text, re.IGNORECASE | re.MULTILINE)
-    
-    if name_match:
-        invoice_data['client_name'] = name_match.group(1).strip()
-    elif invoice_data.get('client_address'):
-        addr_pos = full_text.find(invoice_data['client_address'])
-        if addr_pos > 0:
-            before_address = full_text[max(0, addr_pos-100):addr_pos]
-            name_near_address = r'([A-Z][a-zéèêàâôùûîïç]+\s+[A-Z][a-zéèêàâôùûîïç]+)[,\s]*$'
-            name_match3 = re.search(name_near_address, before_address)
-            if name_match3:
-                potential_name = name_match3.group(1).strip()
-                if potential_name.split()[0] not in ['Votre', 'Donner', 'Merci', 'Complet']:
-                    invoice_data['client_name'] = potential_name
-    
-    if not invoice_data['client_name']:
-        name_pattern = r'\b([A-Z][a-zéèêàâôùûîïç]+)\s+([A-Z][a-zéèêàâôùûîïç]+)\b'
-        name_matches = re.findall(name_pattern, full_text)
-        if name_matches:
-            excluded_words = {'Today', 'Bonjour', 'Pour', 'Tel', 'Nom', 'Adresse', 'Prix', 'Total', 
-                            'Date', 'Commander', 'Commande', 'Merci', 'Parfait', 'Service',
-                            'Votre', 'Donner', 'Pouvez', 'Combien', 'Quelle', 'Couleur'}
-            for first, last in name_matches:
-                if (first not in excluded_words and last not in excluded_words and 
-                    len(first) >= 4 and len(last) >= 4 and 
-                    first[0].isupper() and last[0].isupper()):
-                    invoice_data['client_name'] = f"{first} {last}"
-                    break
-    
-    if not invoice_data['client_name']:
-        invoice_data['client_name'] = "Client"
-    
-    # Extract iPhone orders
-    iphone_pattern = r'(\d+)\s*i[Pp]hone[s]?\s*(\d{0,2})?'
-    iphone_matches = re.findall(iphone_pattern, full_text, re.IGNORECASE)
-    
-    UNIT_PRICE = 250.0
-    items_found = []
-    total_amount = 0.0
-    
-    if iphone_matches:
-        quantities = {}
-        for qty_str, model in iphone_matches:
+            # Try parsing the whole response as JSON
             try:
-                qty = int(qty_str)
-                model_num = model if model else ""
-                key = f"iPhone {model_num}".strip()
-                if key not in quantities:
-                    quantities[key] = 0
-                quantities[key] += qty
-            except ValueError:
-                pass
+                llm_data = json.loads(response_text)
+                print("Successfully parsed entire response as JSON")
+            except json.JSONDecodeError as je:
+                return None, f"Failed to parse response as JSON: {str(je)}\nResponse text: {response_text[:500]}"
         
-        for description, qty in quantities.items():
-            item_total = qty * UNIT_PRICE
-            item = {
-                'description': description,
-                'quantity': qty,
-                'unit_price': UNIT_PRICE,
-                'total': item_total
-            }
-            items_found.append(item)
-            total_amount += item_total
-    
-    # Look for explicit total
-    total_patterns = [
-        r'(?:total|prix\s*total|montant\s*total)[:\s]*(\d+(?:[.,]\d{2})?)\s*[€$]',
-        r'(\d+(?:[.,]\d{2})?)\s*[€$](?:\s*total)?',
-    ]
-    
-    extracted_total = None
-    for pattern in total_patterns:
-        total_match = re.search(pattern, full_text, re.IGNORECASE)
-        if total_match:
-            try:
-                extracted_total = float(total_match.group(1).replace(',', '.'))
-                break
-            except ValueError:
-                pass
-    
-    if extracted_total and items_found:
-        total_amount = extracted_total
-        total_qty = sum(item['quantity'] for item in items_found)
-        expected_total = total_qty * UNIT_PRICE
-        if abs(expected_total - extracted_total) > 0.01:
-            correct_qty = int(round(extracted_total / UNIT_PRICE))
-            if correct_qty > 0 and items_found:
-                items_found[0]['quantity'] = correct_qty
-                items_found[0]['total'] = extracted_total
-    
-    # Extract colors
-    color_pattern = r'(\d+)?\s*(noir|blanc|rouge|rose|bleu|vert)s?'
-    color_matches = re.findall(color_pattern, full_text, re.IGNORECASE)
-    
-    if color_matches and items_found:
-        colors_found = []
-        for qty, color in color_matches:
-            if qty:
-                colors_found.append(f"{qty} {color}")
+        # Validate and fix items
+        items = llm_data.get('items', [])
+        if not items:
+            return None, "No items found in Gemini response"
+        
+        # Ensure correct pricing and totals
+        total = 0.0
+        for item in items:
+            # Ensure quantity is an integer
+            if 'quantity' in item:
+                item['quantity'] = int(item['quantity'])
             else:
-                colors_found.append(color)
-        if colors_found:
-            items_found[0]['description'] += f" ({', '.join(colors_found)})"
-    
-    if not items_found:
-        general_price_pattern = r'(?:prix|price|montant)[:\s]*(\d+(?:[.,]\d{2})?)\s*[€$]'
-        price_match = re.search(general_price_pattern, full_text, re.IGNORECASE)
-        if price_match:
-            try:
-                price = float(price_match.group(1).replace(',', '.'))
-                items_found.append({
-                    'description': 'Service / Produit',
-                    'quantity': 1,
-                    'unit_price': price,
-                    'total': price
-                })
-                total_amount = price
-            except ValueError:
-                pass
-    
-    if not items_found:
-        items_found.append({
-            'description': 'Service / Prestation',
-            'quantity': 1,
-            'unit_price': 0.0,
-            'total': 0.0
-        })
-    
-    invoice_data['items'] = items_found
-    invoice_data['total'] = total_amount
-    return invoice_data
+                item['quantity'] = 1
+            
+            # Ensure unit_price is set (250 for iPhone, or use extracted value)
+            description = item.get('description', '').lower()
+            if 'iphone' in description:
+                # Use extracted unit_price if available, otherwise default to 250
+                if 'unit_price' not in item or item.get('unit_price') is None:
+                    item['unit_price'] = 250.0
+            elif 'unit_price' not in item or item.get('unit_price') is None:
+                # For non-iPhone items, try to use total_price / quantity if available
+                if 'total_price' in item and item.get('total_price') is not None:
+                    item['unit_price'] = item['total_price'] / item['quantity'] if item['quantity'] > 0 else 0.0
+                else:
+                    item['unit_price'] = 250.0  # Default fallback
+            
+            # Calculate item total if not provided
+            if 'total_price' in item and item.get('total_price') is not None:
+                item['total'] = item['total_price']
+            else:
+                item['total'] = item['quantity'] * item['unit_price']
+            
+            total += item['total']
+        
+        # Use invoice_total if provided, otherwise use calculated total
+        if 'invoice_total' in llm_data and llm_data.get('invoice_total') is not None:
+            total = float(llm_data['invoice_total'])
+        
+        # Build invoice data
+        invoice_data = {
+            'client_name': llm_data.get('client_name', 'Client'),
+            'client_address': llm_data.get('client_address', ''),
+            'date': datetime.now().strftime('%d/%m/%Y'),
+            'invoice_number': f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            'items': items,
+            'total': total,
+            'description': ''
+        }
+        
+        return invoice_data, None
+            
+    except json.JSONDecodeError as e:
+        return None, f"JSON parsing error: {str(e)}"
+    except Exception as e:
+        return None, f"Gemini error: {str(e)}"
 
 
 def generate_pdf_invoice(invoice_data, output_path):
-    doc = SimpleDocTemplate(output_path, pagesize=A4)
+    """Generate a professional PDF invoice with structured layout"""
+    
+    # Custom document class to add header/footer
+    class NumberedCanvas(canvas.Canvas):
+        def __init__(self, *args, **kwargs):
+            canvas.Canvas.__init__(self, *args, **kwargs)
+            self._saved_page_states = []
+        
+        def showPage(self):
+            self._saved_page_states.append(dict(self.__dict__))
+            self._startPage()
+        
+        def save(self):
+            """add page info to each page (page x of y)"""
+            num_pages = len(self._saved_page_states)
+            for state in self._saved_page_states:
+                self.__dict__.update(state)
+                self.draw_page_number(num_pages)
+                canvas.Canvas.showPage(self)
+            canvas.Canvas.save(self)
+        
+        def draw_page_number(self, page_count):
+            # Draw header elements
+            self.saveState()
+            
+            # Draw FACTURE title on the left
+            self.setFont("Helvetica-Bold", 28)
+            self.setFillColor(colors.HexColor('#2c3e50'))
+            self.drawString(2*cm, A4[1] - 2.5*cm, "FACTURE")
+            
+            # Draw invoice number box (light gray background with dark border) - under FACTURE on left, wider to fit longer numbers
+            inv_num_x = 2*cm
+            inv_num_y = A4[1] - 3.5*cm
+            # Light gray fill - box is wider (left to right) to accommodate longer invoice numbers
+            self.setFillColor(colors.HexColor('#f5f5f5'))
+            self.setStrokeColor(colors.HexColor('#2c3e50'))
+            self.setLineWidth(1)
+            self.roundRect(inv_num_x, inv_num_y, 8.5*cm, 0.8*cm, 0.3*cm, fill=1, stroke=1)  # Wider: 3.5->8.5cm, height stays 0.8cm
+            
+            # Invoice number text
+            self.setFillColor(colors.HexColor('#2c3e50'))
+            self.setFont("Helvetica", 10)
+            inv_num = invoice_data.get('invoice_number', 'N/A')
+            # Keep the format as is
+            if not inv_num.startswith('INV-'):
+                inv_num_display = f"INV-{inv_num}"
+            else:
+                inv_num_display = inv_num
+            self.drawString(inv_num_x + 0.2*cm, inv_num_y + 0.25*cm, f"Facture n°{inv_num_display}")
+            
+            # Date box (solid dark box) - below invoice number, still on left
+            date_x = 2*cm
+            date_y = A4[1] - 4.5*cm
+            self.setFillColor(colors.HexColor('#2c3e50'))
+            self.setStrokeColor(colors.HexColor('#2c3e50'))
+            self.roundRect(date_x, date_y, 2.5*cm, 0.8*cm, 0.3*cm, fill=1, stroke=1)
+            self.setFillColor(colors.white)
+            self.setFont("Helvetica", 10)
+            date_str = invoice_data.get('date', datetime.now().strftime('%d/%m/%y'))
+            self.drawString(date_x + 0.2*cm, date_y + 0.25*cm, date_str)
+            
+            # Draw logo/image placeholder on far top right (circle only) - original size
+            logo_x = 16.5*cm
+            logo_y = A4[1] - 2.2*cm
+            logo_size = 1.5*cm  # Original size
+            # Draw a circle outline (placeholder for logo)
+            self.setStrokeColor(colors.HexColor('#2c3e50'))
+            self.setFillColor(colors.white)
+            self.setLineWidth(2)
+            # Simple circle as placeholder - can be replaced with actual image later
+            self.circle(logo_x + logo_size/2, logo_y + logo_size/2, logo_size/2, fill=0, stroke=1)
+            
+            self.restoreState()
+    
+    doc = SimpleDocTemplate(output_path, pagesize=A4, 
+                          rightMargin=2*cm, leftMargin=2*cm,
+                          topMargin=4*cm, bottomMargin=3*cm)
     story = []
     styles = getSampleStyleSheet()
     
+    # Custom styles
     title_style = ParagraphStyle(
         'CustomTitle',
         parent=styles['Heading1'],
-        fontSize=24,
+        fontSize=28,
         textColor=colors.HexColor('#2c3e50'),
-        spaceAfter=30,
-        alignment=TA_CENTER
+        spaceAfter=15,
+        alignment=TA_LEFT,
+        fontName='Helvetica-Bold'
     )
     
-    title = Paragraph("FACTURE / INVOICE", title_style)
-    story.append(title)
-    story.append(Spacer(1, 20))
+    sender_style = ParagraphStyle(
+        'SenderStyle',
+        parent=styles['Normal'],
+        fontSize=12,
+        textColor=colors.HexColor('#2c3e50'),
+        fontName='Helvetica-Bold',
+        spaceAfter=5
+    )
     
-    info_data = [
-        ['Numéro de facture:', invoice_data['invoice_number']],
-        ['Date:', invoice_data['date']],
-        ['Client:', invoice_data['client_name']],
+    recipient_header_style = ParagraphStyle(
+        'RecipientHeader',
+        parent=styles['Normal'],
+        fontSize=11,
+        textColor=colors.HexColor('#2c3e50'),
+        fontName='Helvetica-Bold',
+        spaceAfter=8
+    )
+    
+    normal_style = ParagraphStyle(
+        'NormalStyle',
+        parent=styles['Normal'],
+        fontSize=10,
+        textColor=colors.HexColor('#2c3e50'),
+        spaceAfter=3
+    )
+    
+    # Header section (will be drawn by canvas)
+    story.append(Spacer(1, 0.5*cm))
+    
+    # Sender and Recipient information in two columns
+    # Sender name should be bold and match template style
+    sender_name = invoice_data.get('sender_name', 'HEDI')
+    sender_text = f"""<b>{sender_name}</b><br/>
+{invoice_data.get('sender_phone', 'Tel : 123-456-7890')}<br/>
+{invoice_data.get('sender_email', 'hello@reallygreatsite.com')}<br/>
+{invoice_data.get('sender_website', 'reallygreatsite.com')}<br/>
+{invoice_data.get('sender_address', '123 Anywhere St., Any City')}"""
+    sender_info = Paragraph(sender_text, normal_style)
+    
+    recipient_name = invoice_data.get('client_name', 'Client')
+    recipient_address = invoice_data.get('client_address', '')
+    recipient_phone = invoice_data.get('client_phone', '')
+    
+    recipient_text = f"""<b>À L'ATTENTION DE</b><br/>
+<b>{recipient_name}</b>"""
+    if recipient_address:
+        recipient_text += f"<br/>{recipient_address}"
+    if recipient_phone:
+        recipient_text += f"<br/>{recipient_phone}"
+    
+    recipient_info = Paragraph(recipient_text, normal_style)
+    
+    # Create two-column table for sender/recipient
+    info_table_data = [
+        [sender_info, recipient_info]
     ]
-    
-    if invoice_data.get('client_address'):
-        info_data.append(['Adresse:', invoice_data['client_address']])
-    
-    info_table = Table(info_data, colWidths=[5*cm, 10*cm])
+    info_table = Table(info_table_data, colWidths=[9*cm, 9*cm])
     info_table.setStyle(TableStyle([
-        ('FONT', (0, 0), (0, -1), 'Helvetica-Bold', 10),
-        ('FONT', (1, 0), (1, -1), 'Helvetica', 10),
-        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#2c3e50')),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (0, -1), 10),
+        ('RIGHTPADDING', (0, 0), (0, -1), 10),
+        ('LEFTPADDING', (1, 0), (1, -1), 10),
+        ('RIGHTPADDING', (1, 0), (1, -1), 10),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
     ]))
     story.append(info_table)
-    story.append(Spacer(1, 30))
+    story.append(Spacer(1, 1*cm))
     
-    items_data = [['Description', 'Quantité', 'Prix Unitaire', 'Total']]
+    # Items table with proper columns: DESCRIPTION, PRIX, QUANTITÉ, TOTAL
+    items_data = [['DESCRIPTION', 'PRIX', 'QUANTITÉ', 'TOTAL']]
     
+    # Calculate subtotal
+    subtotal = 0.0
     for item in invoice_data['items']:
+        item_total = item.get('total', item.get('quantity', 1) * item.get('unit_price', 0))
+        subtotal += item_total
         items_data.append([
             item['description'],
-            str(item['quantity']),
-            f"{item['unit_price']:.2f} €",
-            f"{item['total']:.2f} €"
+            f"{item.get('unit_price', 0):.2f} €",
+            f"{item.get('quantity', 1):02d}",
+            f"{item_total:.2f} €"
         ])
     
-    items_data.append(['', '', 'TOTAL:', f"{invoice_data['total']:.2f} €"])
+    # Calculate VAT (set to 0 for now)
+    vat_rate = 0.0
+    vat_amount = 0.0
+    total_with_vat = subtotal
     
-    items_table = Table(items_data, colWidths=[8*cm, 3*cm, 3*cm, 3*cm])
+    # Use total from invoice_data if provided, otherwise use calculated total
+    final_total = invoice_data.get('total', total_with_vat)
+    
+    # Create items table
+    items_table = Table(items_data, colWidths=[8*cm, 3*cm, 2.5*cm, 3.5*cm])
     items_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3498db')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        # Header row - dark gray background
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c3e50')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
         ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
         ('FONTSIZE', (0, 0), (-1, 0), 11),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('FONT', (0, 1), (-1, -2), 'Helvetica', 9),
-        ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+        ('TOPPADDING', (0, 0), (-1, 0), 10),
+        
+        # Data rows
+        ('FONT', (0, 1), (-1, -1), 'Helvetica', 10),
         ('ALIGN', (0, 1), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
+        ('ALIGN', (2, 1), (2, -1), 'CENTER'),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('GRID', (0, 0), (-1, -2), 0.5, colors.grey),
-        ('FONT', (0, -1), (-1, -1), 'Helvetica-Bold', 11),
-        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#ecf0f1')),
-        ('ALIGN', (2, -1), (-1, -1), 'RIGHT'),
-        ('TOPPADDING', (0, -1), (-1, -1), 10),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e0e0e0')),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 1), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
     ]))
     story.append(items_table)
+    story.append(Spacer(1, 0.5*cm))
     
-    if invoice_data.get('description'):
-        story.append(Spacer(1, 20))
-        story.append(Paragraph('<b>Notes:</b>', styles['Normal']))
-        story.append(Spacer(1, 10))
-        story.append(Paragraph(invoice_data['description'][:500], styles['Normal']))
+    # Summary section (Subtotal, VAT, Total) - right aligned
+    summary_data = [
+        ['Sous total', f"{subtotal:,.2f} €".replace(',', ' ')],
+        ['TVA (20%)', f"{vat_amount:,.2f} €".replace(',', ' ')],
+        ['TOTAL', f"{final_total:,.2f} €".replace(',', ' ')],
+    ]
     
-    doc.build(story)
+    summary_table = Table(summary_data, colWidths=[4*cm, 4*cm])
+    summary_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('FONT', (0, 0), (0, -1), 'Helvetica', 10),
+        ('FONT', (1, 0), (1, -1), 'Helvetica-Bold', 10),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#2c3e50')),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        # Total row - dark gray background
+        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#2c3e50')),
+        ('TEXTCOLOR', (0, -1), (-1, -1), colors.white),
+        ('FONTSIZE', (0, -1), (-1, -1), 11),
+        ('TOPPADDING', (0, -1), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, -1), (-1, -1), 10),
+    ]))
+    
+    # Right-align the summary table
+    summary_wrapper = Table([[summary_table]], colWidths=[18*cm])
+    summary_wrapper.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (0, 0), 'RIGHT'),
+    ]))
+    story.append(summary_wrapper)
+    story.append(Spacer(1, 1.5*cm))
+    
+    # Footer section - Payment information
+    footer_data = [
+        [
+            Paragraph(f"<b>Paiement à l'ordre de</b><br/>{sender_name}<br/>N° de compte 0123 4567 8901 2345", normal_style),
+            Paragraph(f"<b>Conditions de paiement</b><br/>Paiement sous 30 jours", normal_style)
+        ]
+    ]
+    footer_table = Table(footer_data, colWidths=[9*cm, 9*cm])
+    footer_table.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+        ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+    ]))
+    story.append(footer_table)
+    story.append(Spacer(1, 1*cm))
+    
+    # Thank you message - centered
+    thank_you = Paragraph("<b>MERCI DE VOTRE CONFIANCE</b>", ParagraphStyle(
+        'ThankYou',
+        parent=styles['Normal'],
+        fontSize=12,
+        textColor=colors.HexColor('#2c3e50'),
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold',
+        spaceAfter=0
+    ))
+    story.append(thank_you)
+    
+    # Build PDF with custom canvas
+    doc.build(story, canvasmaker=NumberedCanvas)
     return output_path
 
 
@@ -421,16 +636,21 @@ def index():
     return render_template('index.html')
 
 
-@app.route('/api/check-ollama', methods=['GET'])
-def check_ollama():
+@app.route('/api/check-gemini', methods=['GET'])
+def check_gemini():
+    """Check if Gemini is available"""
     return jsonify({
         'available': LLM_AVAILABLE,
-        'model': 'llama3.2:1b' if LLM_AVAILABLE else None
+        'model': 'gemini-2.5-flash-preview-09-2025' if LLM_AVAILABLE else None
     })
 
 
 @app.route('/api/process-image', methods=['POST'])
 def process_image():
+    """
+    Main endpoint: receives image, performs OCR, interprets data with Gemini, generates PDF
+    Gemini ONLY version - no fallback methods
+    """
     try:
         if 'image' not in request.files:
             return jsonify({'error': 'Aucune image fournie'}), 400
@@ -442,7 +662,9 @@ def process_image():
         if not allowed_file(file.filename):
             return jsonify({'error': 'Type de fichier non autorisé'}), 400
         
-        method = request.form.get('method', 'regex')
+        # Check if Gemini is available - REQUIRED in this version
+        if not LLM_AVAILABLE:
+            return jsonify({'error': 'Google Gemini n\'est pas disponible. Cette version nécessite Gemini pour fonctionner.'}), 503
         
         filename = secure_filename(file.filename)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -457,17 +679,12 @@ def process_image():
         if not extracted_text:
             return jsonify({'error': 'Aucun texte détecté dans l\'image'}), 400
         
-        # Try Ollama if selected, fallback to regex
-        if method == 'ollama' and LLM_AVAILABLE:
-            invoice_data, error = interpret_with_ollama(extracted_text)
-            if error:
-                invoice_data = interpret_invoice_data(extracted_text)
-                method_used = 'regex'
-            else:
-                method_used = 'ollama'
-        else:
-            invoice_data = interpret_invoice_data(extracted_text)
-            method_used = 'regex'
+        # Always use Gemini for interpretation (ONLY method in this version)
+        invoice_data, error = interpret_with_gemini(extracted_text)
+        if error:
+            return jsonify({'error': f'Erreur lors de l\'interprétation avec Gemini: {error}'}), 500
+        
+        method_used = 'gemini'
         
         pdf_filename = f"invoice_{timestamp}.pdf"
         pdf_path = os.path.join(app.config['INVOICE_FOLDER'], pdf_filename)
@@ -500,12 +717,16 @@ def download_invoice(filename):
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("🧾 OCR Invoice Generator - Starting...")
+    print("🧾 OCR Invoice Generator - Gemini ONLY Version")
     print("=" * 60)
     print(f"✓ OCR Engine: {OCR_ENGINE if OCR_ENGINE else 'Not available'}")
-    print(f"✓ LLM: {'Ollama (optional)' if LLM_AVAILABLE else 'Not available (regex only)'}")
+    if LLM_AVAILABLE:
+        print("✓ LLM: Google Gemini 2.5 Flash Preview (REQUIRED)")
+    else:
+        print("✗ ERROR: Google Gemini not available!")
+        print("  This version REQUIRES Gemini to function.")
+        print("  Install: pip install google-genai")
     print("=" * 60)
     print("🌐 Server running at: http://localhost:5000")
     print("=" * 60)
     app.run(debug=True, host='0.0.0.0', port=5000)
-
